@@ -4,9 +4,11 @@ Cai Install - Fluent Design 版本
 """
 import sys
 import os
+import json
 import asyncio
 import logging
 from pathlib import Path
+from collections import deque
 from typing import Optional
 from PyQt6.QtCore import Qt, QSize, pyqtSignal, QThread, pyqtSlot, QUrl, QLocale, QTranslator, QObject, QTimer
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel
@@ -1813,6 +1815,167 @@ class SafeFlowLayout(FlowLayout):
             return item
         return None
 
+class CoverLoader(QObject):
+    """全局封面加载器：并发限流 + 内存缓存 + 新旧 CDN 双路径兜底。
+
+    两个问题一起解决：
+
+    1. 原先每个卡片各自 new 一个 QNetworkAccessManager，搜索一次 50 条结果
+       就是 50 个管理器同时发请求，容易被 CDN 限流，表现为大量封面空白。
+       这里收口成单例，图片并发固定 6。
+
+    2. Steam 已切换商店资源路径。老游戏在
+       `cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg` 仍然可用，
+       但新上架游戏（影之刃零、COD MW4 这类）在该路径直接 404，真实地址在
+       appdetails 接口的 `header_image` 字段里（shared.akamai.steamstatic.com
+       的带 hash 路径）。所以先打老路径，404 再查接口拿真地址重下。
+    """
+
+    LEGACY_CDN = "https://cdn.akamai.steamstatic.com/steam/apps/{}/header.jpg"
+    APP_API = ("https://store.steampowered.com/api/appdetails"
+               "?appids={}&l=schinese&filters=basic")
+
+    MAX_CONCURRENT = 6        # 图片并发
+    MAX_API_CONCURRENT = 2    # 接口并发（防 429）
+    MAX_RETRY = 1
+    RETRY_DELAY_MS = 400
+
+    _instance = None
+
+    @classmethod
+    def instance(cls) -> "CoverLoader":
+        if cls._instance is None:
+            cls._instance = CoverLoader()
+        return cls._instance
+
+    def __init__(self):
+        super().__init__()
+        self._nam = QNetworkAccessManager(self)
+        self._cache = {}          # appid -> QPixmap
+        self._url_cache = {}      # appid -> 接口给出的真实图片地址
+        self._inflight = {}       # appid -> [callback, ...]
+        self._img_queue = deque()  # (url, appid)
+        self._api_queue = deque()  # (appid, attempt)
+        self._active = 0
+        self._api_active = 0
+
+    # ---------- 对外 ----------
+    def load(self, appid, callback):
+        """请求封面。callback(pixmap) 成功；callback(None) 最终失败。"""
+        appid = str(appid)
+        pixmap = self._cache.get(appid)
+        if pixmap is not None and not pixmap.isNull():
+            self._safe_call(callback, pixmap)
+            return
+        if appid in self._inflight:
+            self._inflight[appid].append(callback)
+            return
+        self._inflight[appid] = [callback]
+        self._img_queue.append((self._url_cache.get(appid) or self.LEGACY_CDN.format(appid), appid))
+        self._pump()
+
+    def cached(self, appid):
+        """取缓存，未命中返回 None（不触发网络）。"""
+        return self._cache.get(str(appid))
+
+    # ---------- 调度 ----------
+    def _pump(self):
+        while self._active < self.MAX_CONCURRENT and self._img_queue:
+            url, appid = self._img_queue.popleft()
+            self._active += 1
+            reply = self._nam.get(self._mk_request(url))
+            reply.finished.connect(
+                lambda r=reply, a=appid: self._on_image(a, r)
+            )
+        while self._api_active < self.MAX_API_CONCURRENT and self._api_queue:
+            appid, attempt = self._api_queue.popleft()
+            self._api_active += 1
+            reply = self._nam.get(self._mk_request(self.APP_API.format(appid)))
+            reply.finished.connect(
+                lambda r=reply, a=appid, at=attempt: self._on_api(a, at, r)
+            )
+
+    @staticmethod
+    def _mk_request(url):
+        request = QNetworkRequest(QUrl(url))
+        request.setRawHeader(b"Referer", b"https://store.steampowered.com/")
+        request.setRawHeader(
+            b"User-Agent",
+            b"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            b"(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        )
+        request.setAttribute(
+            QNetworkRequest.Attribute.CacheLoadControlAttribute,
+            QNetworkRequest.CacheLoadControl.PreferCache,
+        )
+        return request
+
+    # ---------- 回调 ----------
+    def _on_image(self, appid, reply):
+        self._active -= 1
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
+        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        pixmap = QPixmap()
+        if ok:
+            ok = pixmap.loadFromData(bytes(reply.readAll()))
+        reply.deleteLater()
+
+        if ok and not pixmap.isNull():
+            self._cache[appid] = pixmap
+            self._done(appid, pixmap)
+        elif status == 404 and appid not in self._url_cache:
+            # 老路径没有这张图：去接口要真实地址
+            self._api_queue.append((appid, 0))
+        else:
+            logging.debug("封面加载失败: appid=%s http=%s", appid, status)
+            self._done(appid, None)
+        self._pump()
+
+    def _on_api(self, appid, attempt, reply):
+        self._api_active -= 1
+        url = None
+        if reply.error() == QNetworkReply.NetworkError.NoError:
+            try:
+                payload = json.loads(bytes(reply.readAll()).decode("utf-8", "ignore"))
+                data = (payload.get(appid) or {}).get("data") or {}
+                url = (
+                    data.get("header_image")
+                    or data.get("capsule_image")
+                    or data.get("capsule_imagev5")
+                )
+            except Exception:
+                url = None
+        reply.deleteLater()
+
+        if url:
+            self._url_cache[appid] = url
+            self._img_queue.append((url, appid))
+        elif attempt < self.MAX_RETRY:
+            QTimer.singleShot(
+                self.RETRY_DELAY_MS,
+                lambda a=appid, at=attempt: self._requeue_api(a, at + 1),
+            )
+        else:
+            self._done(appid, None)
+        self._pump()
+
+    def _requeue_api(self, appid, attempt):
+        self._api_queue.append((appid, attempt))
+        self._pump()
+
+    def _done(self, appid, pixmap):
+        for callback in self._inflight.pop(appid, []):
+            self._safe_call(callback, pixmap)
+
+    @staticmethod
+    def _safe_call(callback, pixmap):
+        try:
+            callback(pixmap)
+        except RuntimeError:
+            # 目标控件已销毁（换页 / 重新搜索），忽略
+            pass
+
+
 class GameCard(CardWidget):
     """游戏卡片组件"""
     
@@ -1822,11 +1985,7 @@ class GameCard(CardWidget):
         self.game_name = game_name
         self.source_type = source_type  # 'st' 或 'gl'
         self.mode = mode  # 'auto' 或 'fixed'
-        
-        # 网络管理器（先初始化）
-        self.network_manager = QNetworkAccessManager(self)
-        self.network_manager.finished.connect(self.on_cover_loaded)
-        
+
         # 创建布局
         self.hBoxLayout = QHBoxLayout(self)
         self.vBoxLayout = QVBoxLayout()
@@ -1913,21 +2072,17 @@ class GameCard(CardWidget):
         self.repaint()
     
     def load_cover(self):
-        """加载游戏封面"""
-        # Steam 封面 URL
-        cover_url = f"https://cdn.akamai.steamstatic.com/steam/apps/{self.appid}/header.jpg"
-        request = QNetworkRequest(QUrl(cover_url))
-        self.network_manager.get(request)
-    
-    @pyqtSlot(QNetworkReply)
-    def on_cover_loaded(self, reply):
-        """封面加载完成"""
-        if reply.error() == QNetworkReply.NetworkError.NoError:
-            data = reply.readAll()
-            pixmap = QPixmap()
-            if pixmap.loadFromData(data):
-                self.coverLabel.setPixmap(pixmap)
-        reply.deleteLater()
+        """加载游戏封面（统一走全局加载器：限并发 + 缓存 + 重试）"""
+        CoverLoader.instance().load(self.appid, self._apply_cover)
+
+    def _apply_cover(self, pixmap):
+        """封面下载完成回调"""
+        if pixmap is None:
+            return
+        try:
+            self.coverLabel.setPixmap(pixmap)
+        except RuntimeError:
+            pass
     
     def on_delete_clicked(self):
         """删除按钮点击"""
@@ -2056,10 +2211,6 @@ class GameCardGrid(CardWidget):
         self.source_type = source_type  # 'st' 或 'gl'
         self.mode = mode  # 'auto' 或 'fixed'
         
-        # 网络管理器（先初始化）
-        self.network_manager = QNetworkAccessManager(self)
-        self.network_manager.finished.connect(self.on_cover_loaded)
-        
         # 创建垂直布局
         self.vBoxLayout = QVBoxLayout(self)
         self.vBoxLayout.setContentsMargins(10, 10, 10, 10)
@@ -2147,21 +2298,17 @@ class GameCardGrid(CardWidget):
             self.coverLabel.setStyleSheet("border-radius: 4px; background: #f0f0f0;")
     
     def load_cover(self):
-        """加载游戏封面"""
-        # Steam 封面 URL
-        cover_url = f"https://cdn.akamai.steamstatic.com/steam/apps/{self.appid}/header.jpg"
-        request = QNetworkRequest(QUrl(cover_url))
-        self.network_manager.get(request)
-    
-    @pyqtSlot(QNetworkReply)
-    def on_cover_loaded(self, reply):
-        """封面加载完成"""
-        if reply.error() == QNetworkReply.NetworkError.NoError:
-            data = reply.readAll()
-            pixmap = QPixmap()
-            if pixmap.loadFromData(data):
-                self.coverLabel.setPixmap(pixmap)
-        reply.deleteLater()
+        """加载游戏封面（统一走全局加载器：限并发 + 缓存 + 重试）"""
+        CoverLoader.instance().load(self.appid, self._apply_cover)
+
+    def _apply_cover(self, pixmap):
+        """封面下载完成回调"""
+        if pixmap is None:
+            return
+        try:
+            self.coverLabel.setPixmap(pixmap)
+        except RuntimeError:
+            pass
     
     def on_delete_clicked(self):
         """删除按钮点击"""
@@ -3301,10 +3448,6 @@ class SearchResultCard(CardWidget):
         self.appid = appid
         self.game_name = game_name
         
-        # 网络管理器
-        self.network_manager = QNetworkAccessManager(self)
-        self.network_manager.finished.connect(self.on_cover_loaded)
-        
         # 创建布局
         self.hBoxLayout = QHBoxLayout(self)
         self.vBoxLayout = QVBoxLayout()
@@ -3369,20 +3512,17 @@ class SearchResultCard(CardWidget):
             self.coverLabel.setStyleSheet("border-radius: 4px; background: #f0f0f0;")
     
     def load_cover(self):
-        """加载游戏封面"""
-        cover_url = f"https://cdn.akamai.steamstatic.com/steam/apps/{self.appid}/header.jpg"
-        request = QNetworkRequest(QUrl(cover_url))
-        self.network_manager.get(request)
-    
-    @pyqtSlot(QNetworkReply)
-    def on_cover_loaded(self, reply):
-        """封面加载完成"""
-        if reply.error() == QNetworkReply.NetworkError.NoError:
-            data = reply.readAll()
-            pixmap = QPixmap()
-            if pixmap.loadFromData(data):
-                self.coverLabel.setPixmap(pixmap)
-        reply.deleteLater()
+        """加载游戏封面（统一走全局加载器：限并发 + 缓存 + 重试）"""
+        CoverLoader.instance().load(self.appid, self._apply_cover)
+
+    def _apply_cover(self, pixmap):
+        """封面下载完成回调"""
+        if pixmap is None:
+            return
+        try:
+            self.coverLabel.setPixmap(pixmap)
+        except RuntimeError:
+            pass
     
     def on_select_clicked(self):
         """入库按钮点击 - 直接入库"""
@@ -3474,10 +3614,6 @@ class SearchResultCardGrid(CardWidget):
         self.appid = appid
         self.game_name = game_name
         
-        # 网络管理器
-        self.network_manager = QNetworkAccessManager(self)
-        self.network_manager.finished.connect(self.on_cover_loaded)
-        
         # 创建垂直布局
         self.vBoxLayout = QVBoxLayout(self)
         self.vBoxLayout.setContentsMargins(10, 10, 10, 10)
@@ -3549,20 +3685,17 @@ class SearchResultCardGrid(CardWidget):
             self.coverLabel.setStyleSheet("border-radius: 4px; background: #f0f0f0;")
     
     def load_cover(self):
-        """加载游戏封面"""
-        cover_url = f"https://cdn.akamai.steamstatic.com/steam/apps/{self.appid}/header.jpg"
-        request = QNetworkRequest(QUrl(cover_url))
-        self.network_manager.get(request)
-    
-    @pyqtSlot(QNetworkReply)
-    def on_cover_loaded(self, reply):
-        """封面加载完成"""
-        if reply.error() == QNetworkReply.NetworkError.NoError:
-            data = reply.readAll()
-            pixmap = QPixmap()
-            if pixmap.loadFromData(data):
-                self.coverLabel.setPixmap(pixmap)
-        reply.deleteLater()
+        """加载游戏封面（统一走全局加载器：限并发 + 缓存 + 重试）"""
+        CoverLoader.instance().load(self.appid, self._apply_cover)
+
+    def _apply_cover(self, pixmap):
+        """封面下载完成回调"""
+        if pixmap is None:
+            return
+        try:
+            self.coverLabel.setPixmap(pixmap)
+        except RuntimeError:
+            pass
     
     def on_select_clicked(self):
         """选择按钮点击"""
