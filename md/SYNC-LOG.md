@@ -8,6 +8,19 @@
 
 ## 时间线（新→旧）
 
+### 2026-11-01 20:50 新增单实例锁
+
+- 基线：`local` @ e536a61 / `upstream/main` @ d8ccb75
+- 结论：原版没有单实例机制，重复点击开始菜单会起第二个进程、两个实例同时写 `config/config.json`。改为「已有实例就把它的窗口拉到前台，本次启动直接退出」。
+- 变更：
+  - 新增 `app/single_instance.py`：`SingleInstanceGuard`（`QLocalServer` / `QLocalSocket`，Windows 上是命名管道 `FluentInstall-SingleInstance-v1`）+ `activate_window()`（`raise_` / `activateWindow` + Win32 `ShowWindow(SW_RESTORE)` / `SetForegroundWindow` 兜底）
+  - `main.py`：`QApplication` 之后、`MainWindow` 之前判定；`sys.exit(0)` 而不是继续
+  - `app/fluent_app.py`：同样的接线做在其自己的 `main()` 里，保证 `python app/fluent_app.py` 也受控
+  - 自我重启兜底：`fluent_app.py` 里「换语言 → `os.execl` 重开自己」那段先设 `FLUENTINSTALL_SELF_RESTART=1`，新进程走「等旧进程释放管道、重试 5 秒」分支，避免被自己的锁拦死
+- 自检：`py_compile` 五个入口文件通过；实测两次启动 —— 第二个实例打印「已有实例在运行，已唤起它的窗口，本次启动退出」退出码 0，第一个实例 stderr 出现「收到重复启动请求，唤起已有窗口」，进程数不变；模拟重启（带 `FLUENTINSTALL_SELF_RESTART=1`）不被拦截
+- 观察记录：本机 venv 的 `python.exe` 是 241KB 启动器，**每次都伴生两个同命令行 python.exe**（启动器 + 真解释器），之前误判成「用户开了两个实例」；判断多开要看内存占用的那个
+- 回滚点：`e536a61`（上一个 local 提交）
+
 ### 2026-11-01 20:35 首次接管：建立 local 分支
 
 - 基线：`local` @ 3bf6e61 / `upstream/main` @ d8ccb75（源码版 3.1.6，Python + PyQt6）

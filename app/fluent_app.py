@@ -29,6 +29,11 @@ from qfluentwidgets import (
     Slider
 )
 
+try:
+    from app.single_instance import RESTART_ENV, SingleInstanceGuard, activate_window
+except ImportError:  # 以脚本方式直接运行 app/fluent_app.py 时
+    from single_instance import RESTART_ENV, SingleInstanceGuard, activate_window
+
 # 项目根目录（兼容直接运行和 PyInstaller 打包）
 def _get_app_root() -> Path:
     if getattr(sys, 'frozen', False):
@@ -6525,6 +6530,8 @@ class SettingsPage(ScrollArea):
             from PyQt6.QtWidgets import QApplication
             QApplication.quit()
             import os
+            # 告诉新进程「这是自我重启」，别被自己的实例锁拦住
+            os.environ[RESTART_ENV] = "1"
             os.execl(sys.executable, sys.executable, *sys.argv)
         else:
             # 用户取消，恢复原来的选择
@@ -7518,7 +7525,13 @@ def main():
     theme_config = load_theme_config()
     
     app = QApplication(sys.argv)
-    
+
+    # 单实例锁：已有实例在跑就唤起它，本次启动退出
+    instance_guard = SingleInstanceGuard()
+    if not instance_guard.try_acquire():
+        print("[single-instance] 已有实例在运行，已唤起它的窗口，本次启动退出")
+        sys.exit(0)
+
     # fluent 使用 setPixelSize 设置字体，导致 pointSize() 返回 -1
     # Qt 内部在字体继承时读取 pointSize 并尝试 setPointSize(-1) 触发警告
     # 用消息过滤器屏蔽这条无害警告
@@ -7569,6 +7582,7 @@ def main():
     
     # 创建主窗口
     window = MainWindow()
+    instance_guard.activateRequested.connect(lambda: activate_window(window))
     
     # 加载并应用窗口特效
     try:

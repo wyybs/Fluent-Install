@@ -34,7 +34,9 @@
 - 装机：无。源码直接在仓库根用 `.venv` 运行，**改完只要重启程序就生效**。
 - 启动：`D:\Program Files\FluentInstall\.venv\Scripts\pythonw.exe D:\Program Files\FluentInstall\main.py`
 - 开始菜单入口：`%APPDATA%\Microsoft\Windows\Start Menu\Programs\FluentInstall-源码版.lnk`（pywin32 生成，指向上面那条命令）
-- 自检：`./.venv/Scripts/python.exe -m py_compile main.py app/fluent_app.py backend/cai_backend.py backend/trainer_backend.py`
+- 自检：`./.venv/Scripts/python.exe -m py_compile main.py app/fluent_app.py app/single_instance.py backend/cai_backend.py backend/trainer_backend.py`
+- 单实例锁回归：先开一个实例，再执行一次 `python main.py`，第二条应打印「已有实例在运行」并立即退出（退出码 0），第一个实例的 stderr 应出现「收到重复启动请求，唤起已有窗口」。
+- 注意本机 venv 的 `python.exe` 是 241KB 的启动器（`pyvenv.cfg` 里的 `home` 指向 `~/.workbuddy/binaries/python/versions/3.13.12`），**每次启动会看到两个同命令行的 python.exe**，一个是启动器、一个是真解释器，属正常；判断是否多开要看内存占用的那个。
 - 界面改动要真跑一遍：`python main.py` 起窗口，搜一个游戏确认封面/按钮正常，再 `git status` 看有没有误提交 `config/`、`logs/`。
 
 ## 4. 禁区
