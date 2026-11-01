@@ -466,11 +466,23 @@ class CaiBackend:
         else:
             is_steamtools = (self.steam_path / 'config' / 'stplug-in').is_dir()
             is_greenluma = any((self.steam_path / dll).exists() for dll in ['GreenLuma_2026_x86.dll', 'GreenLuma_2026_x64.dll'])
+            # 真正的内核是注入用的 DLL；只有 config/stplug-in 目录不代表装了 SteamTools
+            # （该目录在下面的 try 里会被自动创建，所以拿它当判据一定是假阳性）
+            steamtools_kernel = any((self.steam_path / dll).exists() for dll in [
+                'dwmapi.dll', 'xinput1_4.dll', 'OpenSteamTool.dll', 'steamtools.dll', 'hid.dll',
+            ])
             if is_steamtools and is_greenluma:
                 self.log.error("环境冲突：同时检测到SteamTools和GreenLuma！请在设置中强制指定一个。")
                 self.unlocker_type = "conflict"
             elif is_steamtools:
-                self.log.info("自动检测到解锁工具: SteamTools")
+                if steamtools_kernel:
+                    self.log.info("自动检测到解锁工具: SteamTools")
+                else:
+                    self.log.warning(
+                        "检测到 config/stplug-in 目录，但 Steam 根目录下没有任何内核 DLL"
+                        "（dwmapi.dll / xinput1_4.dll / OpenSteamTool.dll 均不存在）。"
+                        "lua 会照常生成，但 Steam 不会加载它，游戏不会真正入库——先装解锁器内核。"
+                    )
                 self.unlocker_type = "steamtools"
             elif is_greenluma:
                 self.log.info("自动检测到解锁工具: GreenLuma")
