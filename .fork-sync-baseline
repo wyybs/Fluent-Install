@@ -1,0 +1,7 @@
+# 能力基线——放仓库根，文件名固定 .fork-sync-baseline
+# 格式：label|文件路径|计数用正则     ← 竖线两侧不要加空格（inspect.sh 不 trim，带空格会导致计数为 0）
+# 数量变少 = 疑似收窄，需要人工确认
+后端函数数|backend/cai_backend.py|def [a-zA-Z_]
+修改器后端函数数|backend/trainer_backend.py|def [a-zA-Z_]
+语言包数|app/fluent_app.py|"about_text":
+封面加载调用点|app/fluent_app.py|CoverLoader\.instance\(\)\.load
